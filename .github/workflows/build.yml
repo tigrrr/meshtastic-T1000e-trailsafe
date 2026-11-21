@@ -1,0 +1,42 @@
+name: build
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('UPSTREAM_REF', 'overlay/**/*.ini') }}
+      - name: Host test
+        run: g++ -std=c++17 -Wall -Wextra -Werror -I overlay/src/modules/optional/ButtonMessage test/test_logic.cpp -o /tmp/test_logic && /tmp/test_logic
+      - name: Build firmware
+        run: ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: trailsafe-${{ github.sha }}
+          path: dist/*.uf2
+          if-no-files-found: error
+      # Pushes to the default branch publish <upstream tag>-<overlay commit>,
+      # marked pre-release when the upstream Meshtastic release is.
+      - name: Release
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          upstream=$(cat UPSTREAM_REF)
+          tag="$upstream-$(git rev-parse --short HEAD)"
+          pre=$(gh api "repos/meshtastic/firmware/releases/tags/$upstream" --jq '.prerelease' 2>/dev/null || echo false)
+          [ "$pre" = "true" ] && flag=--prerelease || flag=
+          gh release create "$tag" dist/*.uf2 $flag --title "TrailSafe $tag" --generate-notes \
+            --notes "Meshtastic [$upstream](https://github.com/meshtastic/firmware/releases/tag/$upstream) + TrailSafe overlay $(git rev-parse --short HEAD). Flash the .uf2 per the README."
