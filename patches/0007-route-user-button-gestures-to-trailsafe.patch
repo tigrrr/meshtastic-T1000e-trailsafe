@@ -1,0 +1,82 @@
+diff --git a/src/input/ButtonThread.cpp b/src/input/ButtonThread.cpp
+index 251311d..f21cecd 100644
+--- a/src/input/ButtonThread.cpp
++++ b/src/input/ButtonThread.cpp
+@@ -13,6 +13,9 @@
+ #include "main.h"
+ #include "modules/CannedMessageModule.h"
+ #include "modules/ExternalNotificationModule.h"
++#ifdef BUTTON_MESSAGE
++#include "modules/optional/ButtonMessage/ButtonMessage.h"
++#endif
+ #include "sleep.h"
+ #ifdef ARCH_PORTDUINO
+ #include "platform/portduino/PortduinoGlue.h"
+@@ -109,6 +112,10 @@ bool ButtonThread::initButton(const ButtonConfig &config)
+     } else {
+         userButton.setClickMs(BUTTON_CLICK_MS);
+     }
++#ifdef BUTTON_MESSAGE
++    if (this == UserButtonThread)
++        userButton.setClickMs(BUTTON_MESSAGE_CLICK_MS);
++#endif
+     attachButtonInterrupts();
+ #ifdef ARCH_ESP32
+     // Register callbacks for before and after lightsleep
+@@ -228,9 +235,13 @@ int32_t ButtonThread::runOnce()
+         }
+ 
+         case BUTTON_EVENT_DOUBLE_PRESSED: { // only on boards binding ButtonConfig::doublePress
+-            LOG_INFO("Double press");
+             // Reset combination tracking
+             waitingForLongPress = false;
++#ifdef BUTTON_MESSAGE
++            if (buttonMessageModule && buttonMessageModule->queueClicks(this, 2))
++                break;
++#endif
++            LOG_INFO("Double press");
+ 
+             evt.inputEvent = _doublePress;
+             // evt.kbchar = _doublePress;
+@@ -241,10 +252,13 @@ int32_t ButtonThread::runOnce()
+         }
+ 
+         case BUTTON_EVENT_MULTI_PRESSED: { // not wired in when screen is present
+-            LOG_INFO("Mulitipress! %hux", multipressClickCount);
+-
+             // Reset combination tracking
+             waitingForLongPress = false;
++#ifdef BUTTON_MESSAGE
++            if (buttonMessageModule && buttonMessageModule->queueClicks(this, multipressClickCount))
++                break;
++#endif
++            LOG_INFO("Mulitipress! %hux", multipressClickCount);
+ 
+             switch (multipressClickCount) {
+             case 3:
+diff --git a/src/input/ButtonThread.h b/src/input/ButtonThread.h
+index e724c35..d79bae6 100644
+--- a/src/input/ButtonThread.h
++++ b/src/input/ButtonThread.h
+@@ -71,6 +71,14 @@ class ButtonThread : public Observable<const InputEvent *>, public concurrency::
+     void attachButtonInterrupts();
+     void detachButtonInterrupts();
+     void storeClickCount();
++#ifdef BUTTON_MESSAGE
++    void resetClicks()
++    {
++        userButton.reset();
++        if (btnEvent == BUTTON_EVENT_DOUBLE_PRESSED || btnEvent == BUTTON_EVENT_MULTI_PRESSED)
++            btnEvent = BUTTON_EVENT_NONE;
++    }
++#endif
+     bool isButtonPressed(int buttonPin)
+     {
+         if (_activeLow)
+@@ -135,3 +143,6 @@ class ButtonThread : public Observable<const InputEvent *>, public concurrency::
+ };
+ 
+ extern ButtonThread *buttonThread;
++#ifdef BUTTON_MESSAGE
++extern ButtonThread *UserButtonThread;
++#endif

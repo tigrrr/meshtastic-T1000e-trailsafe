@@ -37,8 +37,8 @@ inline bool messageAt(const char *list, unsigned idx, char *out, size_t n, bool 
 }
 
 enum class State { IDLE, WAIT, CRITICAL };
-enum class Event { ACK_HOME = 0, ACK_RELAY, NAK_PKI, NAK_OTHER };
-enum class Action { NONE, SEND, RESEND, STOCK_PING, STOCK_GPS, STOCK_MUTE, TONE_ACK, TONE_FAIL, NODEINFO_FAIL };
+enum class Event { NONE, ACK, NAK };
+enum class Action { NONE, SEND, RESEND, TONE_ACK, TONE_FAIL };
 
 struct Logic {
     const uint32_t bootGuardMs, ackTimeoutMs, retryMs, maxAttempts;
@@ -51,13 +51,11 @@ struct Logic {
     {
     }
 
-    // n presses were counted. hasMessage: a message exists at index n-2. Any send replaces whatever was pending.
-    Action onClicks(unsigned n, bool hasMessage, bool msgCritical, uint32_t now)
+    bool acceptsClicks(uint32_t now) const { return now >= bootGuardMs; }
+
+    // Any new message replaces the pending send.
+    Action onMessage(bool msgCritical, uint32_t now)
     {
-        if (now < bootGuardMs || n < 2)
-            return Action::NONE;
-        if (!hasMessage)
-            return n == 2 ? Action::STOCK_PING : n == 3 ? Action::STOCK_GPS : n == 4 ? Action::STOCK_MUTE : Action::NONE;
         critical = msgCritical;
         attempts = 1;
         lastSend = now;
@@ -65,27 +63,17 @@ struct Logic {
         return Action::SEND;
     }
 
-    // ponytail: one NAK ends a WAIT even with several favorites; per-target bookkeeping if a second home node matters.
-    Action onEvent(Event e, uint32_t)
+    Action onEvent(Event event)
     {
-        if (state == State::IDLE)
+        if (state == State::IDLE || event == Event::NONE)
             return Action::NONE;
-        switch (e) {
-        case Event::ACK_HOME:
+        if (event == Event::ACK) {
             state = State::IDLE;
             return Action::TONE_ACK;
-        case Event::ACK_RELAY:
-            return Action::NONE;
-        case Event::NAK_PKI:
-            if (state == State::WAIT)
-                state = State::IDLE;
-            return Action::NODEINFO_FAIL;
-        case Event::NAK_OTHER:
-            if (state == State::WAIT)
-                state = State::IDLE;
-            return Action::TONE_FAIL;
         }
-        return Action::NONE;
+        if (state == State::WAIT)
+            state = State::IDLE;
+        return Action::TONE_FAIL;
     }
 
     Action onTick(uint32_t now)
@@ -105,8 +93,6 @@ struct Logic {
         }
         return Action::NONE;
     }
-
-    void abort() { state = State::IDLE; }
 
     // ms until onTick has something to do; UINT32_MAX when idle.
     uint32_t nextWakeMs(uint32_t now) const

@@ -10,20 +10,19 @@ void setupButtonMessage();
 #include "concurrency/OSThread.h"
 #include "mesh/generated/meshtastic/cannedmessages.pb.h"
 
+class ButtonThread;
+
 #ifndef BUTTON_MESSAGE_RETRY_MS
-#define BUTTON_MESSAGE_RETRY_MS 120000 // critical ('!') messages are resent this often until a favorite acks
+#define BUTTON_MESSAGE_RETRY_MS 120000 // critical ('!') broadcasts retry at this interval until acknowledged
 #endif
 #ifndef BUTTON_MESSAGE_MAX_ATTEMPTS
 #define BUTTON_MESSAGE_MAX_ATTEMPTS 60
 #endif
 #ifndef BUTTON_MESSAGE_ACK_TIMEOUT_MS
-#define BUTTON_MESSAGE_ACK_TIMEOUT_MS 60000 // normal messages: fail tone when no favorite has acked by then
+#define BUTTON_MESSAGE_ACK_TIMEOUT_MS 60000 // normal messages: fail tone if the mesh has not acknowledged the broadcast
 #endif
 #ifndef BUTTON_MESSAGE_BOOT_GUARD_MS
 #define BUTTON_MESSAGE_BOOT_GUARD_MS 10000 // ignore presses this long after boot (the power-on press); 0 after a button wake
-#endif
-#ifndef BUTTON_MESSAGE_MAX_TARGETS
-#define BUTTON_MESSAGE_MAX_TARGETS 4
 #endif
 #ifndef BUTTON_MESSAGE_CLICK_MS
 #define BUTTON_MESSAGE_CLICK_MS 250 // max gap between presses of one gesture (stock value); raise if multi-press is fiddly
@@ -33,8 +32,8 @@ void setupButtonMessage();
 #endif
 
 /**
- * Canned messages for screenless devices. N presses (N >= 2) sends canned message N-1 as a direct message to every
- * favorite node and confirms delivery with the buzzer. A message starting with '!' is resent until a favorite acks.
+ * Canned messages for screenless devices. N presses (N >= 2) broadcasts canned message N-1 on the first channel.
+ * The buzzer signals a mesh acknowledgement. A message starting with '!' is retried until acknowledged or exhausted.
  * Press counts without a message keep the stock behavior. Configured through the stock canned-message settings:
  * canned_message.enabled, canned_message.send_bell and the canned message list.
  */
@@ -42,6 +41,7 @@ class ButtonMessageModule : public SinglePortModule, private concurrency::OSThre
 {
   public:
     ButtonMessageModule();
+    bool queueClicks(const ButtonThread *button, unsigned clicks);
     AdminMessageHandleResult handleAdminMessageForModule(const meshtastic_MeshPacket &mp, meshtastic_AdminMessage *request,
                                                          meshtastic_AdminMessage *response) override;
 
@@ -51,32 +51,25 @@ class ButtonMessageModule : public SinglePortModule, private concurrency::OSThre
     int32_t runOnce() override;
 
   private:
-    static void onDoubleClick(void *self);
-    static void onMultiClick(void *self);
-    void attachButton();
     void sayReady();
     void perform(bm::Action a);
-    uint8_t sendToFavorites(const char *text);
+    bool sendToFirstChannel();
     void loadMessages();
     bool saveMessages();
     // Power saving: hold off deep sleep (radio off) while a delivery is unresolved
-    int preflightSleepCb(void *) { return logic.state != bm::State::IDLE; }
+    int preflightSleepCb(void *) { return pendingClicks || logic.state != bm::State::IDLE; }
 
     bm::Logic logic;
     CallbackObserver<ButtonMessageModule, void *> preflightSleepObserver =
         CallbackObserver<ButtonMessageModule, void *>(this, &ButtonMessageModule::preflightSleepCb);
     meshtastic_CannedMessageModuleConfig messages = meshtastic_CannedMessageModuleConfig_init_zero;
     char current[sizeof(messages.messages)] = {0}; // text of the message in flight, for resends
-    volatile uint8_t pendingClicks = 0;             // set by the button callbacks, possibly in ISR context
-    bool readyTone = false;                         // button wake: play '.' once the main loop cycles
-    uint8_t readyPass = 0;                          // runOnce passes seen while readyTone is pending
-    volatile uint8_t pendingEvents = 0;             // one bit per bm::Event, set by handleReceived
-    NodeNum nakNode = 0;
-    struct {
-        PacketId id;
-        NodeNum dest;
-    } pending[BUTTON_MESSAGE_MAX_TARGETS];
-    uint8_t nPending = 0;
+    unsigned pendingClicks = 0;
+    bool pendingCritical = false;
+    bool readyTone = false; // button wake: play '.' once the main loop cycles
+    uint8_t readyPass = 0;
+    PacketId pendingPacketId = 0;
+    bm::Event pendingEvent = bm::Event::NONE;
 };
 
 extern ButtonMessageModule *buttonMessageModule;

@@ -1,11 +1,11 @@
 # T1000 TrailSafe
 
-Meshtastic firmware for the Seeed SenseCAP T1000-E that turns the front button into canned messages with delivery
-confirmation. Two presses sends message 1, three presses message 2, and so on, as a direct message to every node you
-have marked as a favorite. The buzzer tells you when a favorite has received it. A message that starts with `!` is
-resent every two minutes until a favorite acknowledges it.
+Meshtastic firmware for the Seeed SenseCAP T1000-E that turns the front button into canned messages with mesh
+acknowledgements. Two presses send message 1, three send message 2, and so on. The tracker broadcasts on the first
+channel (slot 0) and sounds the buzzer when it hears a node rebroadcast the message. A message that starts with `!`
+is resent every two minutes until acknowledged or the retry limit is reached.
 
-It is stock Meshtastic plus one drop-in module (`ButtonMessage`) and a one-line patch, rebuilt against upstream
+It is based on Meshtastic with a `ButtonMessage` module and a set of patches, rebuilt against upstream
 releases by GitHub Actions. Everything is configured from the Meshtastic app or CLI; nothing needs a rebuild.
 
 ## Button
@@ -34,8 +34,8 @@ Morse notation: `.` is one unit, `-` is three. One unit is 80 ms (`BUTTON_MESSAG
 | `.` (E) | awake after a button wake, listening |
 | `..` (I, "info") | message sent |
 | `--` (M, "mayday") | `!` message sent or resent |
-| `--.` (G, for "good") | a favorite received it |
-| two 7-unit tones, 7 units apart (intentionally invalid) | not delivered: no favorites, no key for the favorite yet, the mesh rejected it, or nobody acked within a minute. For a `!` message the resends continue. |
+| `--.` (G, for "good") | the tracker heard a mesh rebroadcast |
+| two 7-unit tones, 7 units apart (intentionally invalid) | the send failed or the tracker heard no rebroadcast before the timeout. A `!` message keeps retrying until acknowledged or the retry limit is reached. |
 
 Tones follow the device's buzzer mode setting. The stock single press, and stock actions for unconfigured press counts,
 keep their stock sounds.
@@ -56,22 +56,20 @@ keep their stock sounds.
 
    The list is at most 200 characters. Changing the list takes effect immediately; changing the toggles reboots the
    device (stock behavior).
-3. **Favorites.** While the app is connected to the T1000-E, mark the node(s) that should receive the messages as
-   favorites. Messages go to every favorite (up to four); the first one to acknowledge counts.
+3. **Channel.** Enable the first channel (slot 0) on the T1000-E and give the receiving nodes the same channel settings.
 4. **Receiver.** On the receiving node, enable External Notification with the message and bell alerts you want
-   (buzzer, LED, vibration). Its screen and the connected phone show the message as a normal direct message.
+   (buzzer, LED, vibration). Its screen and the connected phone show the message in the shared channel.
 
 ### Channels
 
-- **Acknowledgements travel on the primary channel**, so the tracker and the receiver must share it. The default
-  LongFast primary is fine.
+- **Canned messages use the first channel's settings**, including its shared key. The default LongFast channel uses
+  a well-known shared key. For group-only messages, set a private shared key on slot 0.
+- **A broadcast acknowledgement measures mesh relay.** Nodes configured to receive without rebroadcasting can read
+  the message. The buzzer confirms a rebroadcast that reached the tracker.
 - **Position precision and privacy come from your channel settings.** The position broadcast goes to the
   lowest-numbered channel with position sharing enabled, at that channel's precision. For a precise position that only
   your group can read: turn position off on the primary channel and add a private secondary channel with position
   precision set to precise, on both devices.
-- **Direct messages are encrypted to the favorite's public key.** The tracker needs the favorite's key, which it
-  learns when the nodes first see each other. If it is missing you get the not-delivered tone; the tracker then asks for the key,
-  so the next attempt works.
 
 ### Power saving
 
@@ -88,8 +86,8 @@ and switches off with them; there is nothing extra to configure or rebuild. With
   are dropped, and the presses after it count as usual (two for message 1). A timed wake stays silent and, like a
   power-on, ignores presses for its first 10 s.
 - **It stays awake until a delivery is resolved.** While a message waits for its acknowledgement it does not sleep:
-  up to a minute for a normal message, and for a `!` message until a favorite acks or the resends run out (about two
-  hours). If anything holds the sleep off for a whole broadcast interval, the tracker skips that sleep and tries
+  up to a minute for a normal message, and for a `!` message until the mesh acknowledges it or the resends run out
+  (about two hours). If anything holds the sleep off for a whole broadcast interval, the tracker skips that sleep and tries
   again after its next position broadcast.
 - **Low battery still wins.** The low-battery shutdown waits at most 30 s for a pending delivery, then shuts down
   anyway.
@@ -126,7 +124,7 @@ The host-side logic test runs without PlatformIO:
 ### What is in the overlay
 
 - `overlay/src/modules/optional/ButtonMessage/`: the module. Upstream's optional-module hook compiles and registers
-  anything in that directory, so no upstream file changes for the module itself.
+  anything in that directory.
 - `overlay/variants/nrf52840/trailsafe/platformio.ini`: the build environment, extending the stock T1000-E one.
 - `patches/0001-…`: one `#if` line in `src/main.cpp` so the firmware reports the canned-message settings as
   available, which makes the phone apps show the editor for a screenless device.
@@ -146,6 +144,7 @@ The host-side logic test runs without PlatformIO:
 - `patches/0006-…`: the node database is no longer rewritten at every boot. Upstream's changed-at-boot check CRCs a
   struct of `std::vector`s (their pointers, not the nodes) before a self-care pass that reallocates the vector, so it
   always saw a change; the check now runs after self-care.
+- `patches/0007-…`: the button thread offers double and multi-press events to `ButtonMessage` before handling them.
 
 0002–0004 and 0006 are general fixes written to be offered upstream.
 
@@ -159,7 +158,7 @@ builds can add `-DBUTTON_MESSAGE_FAKE_WAKE` (a timed wake behaves like a button 
 The `upstream` workflow runs weekly (and on demand). When Meshtastic publishes a newer release tag (prereleases
 included; run it with *stable_only* to ignore them), it bumps `UPSTREAM_REF` on a branch, builds, and opens a pull
 request with the UF2 attached to the run. A PR marked **build FAILED** means the overlay or the patch no longer fits
-upstream: fix it on that branch, push, and merge. Every push to `master`, including merging a sync PR, publishes a GitHub release named
+upstream: fix it on that branch, push, and merge. Every push to the default branch, including a merged sync PR, publishes a GitHub release named
 `<upstream tag>-<overlay commit>` with the UF2 attached, marked pre-release whenever the upstream Meshtastic release is.
 
 ## License

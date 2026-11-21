@@ -1,7 +1,7 @@
 name: build
 on:
   push:
-    branches: [master]
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -27,10 +27,10 @@ jobs:
           name: trailsafe-${{ github.sha }}
           path: dist/*.uf2
           if-no-files-found: error
-      # Every push to master (including a merged upstream-sync PR) becomes a release: <upstream tag>-<overlay commit>,
+      # Pushes to the default branch publish <upstream tag>-<overlay commit>,
       # marked pre-release when the upstream Meshtastic release is.
       - name: Release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

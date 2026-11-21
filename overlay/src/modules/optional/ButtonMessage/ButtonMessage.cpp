@@ -1,6 +1,7 @@
 #include "ButtonMessage.h"
 
 #ifdef BUTTON_MESSAGE
+#include "Channels.h"
 #include "FSCommon.h"
 #include "GPS.h"
 #include "MeshService.h"
@@ -8,10 +9,8 @@
 #include "SPILock.h"
 #include "buzz.h"
 #include "input/ButtonThread.h"
-#include "mesh-pb-constants.h"
-#include "modules/ExternalNotificationModule.h"
-#include "modules/NodeInfoModule.h"
 #include "sleep.h"
+#include <algorithm>
 
 static const char *messagesFile = "/prefs/cannedConf.proto"; // same file and proto as the stock CannedMessageModule
 
@@ -32,7 +31,6 @@ static const ToneDuration FAILED[] = {{B3, 7 * U}, {REST, 4 * U}, {B3, 7 * U}}; 
 static const ToneDuration READY[] = {{B3, U}};                                   // . (woken by the button, listening)
 #define PLAY(m) playTones(m, sizeof(m) / sizeof(m[0]))
 
-extern ButtonThread *UserButtonThread; // defined in input/InputBroker.cpp; no header declares it
 ButtonMessageModule *buttonMessageModule;
 
 // A press ended the tracker's power-saving sleep: there is no power-on press to guard against, so listen at once.
@@ -61,7 +59,7 @@ ButtonMessageModule::ButtonMessageModule()
     loadMessages();
     preflightSleepObserver.observe(&preflightSleep);
     if (moduleConfig.canned_message.enabled) {
-        LOG_INFO("ButtonMessage enabled: '%s'", messages.messages);
+        LOG_INFO("ButtonMessage enabled, canned list %s", messages.messages[0] ? "loaded" : "empty");
     } else {
         LOG_INFO("ButtonMessage disabled (canned_message.enabled is false)");
         disable();
@@ -76,13 +74,12 @@ ButtonMessageModule::ButtonMessageModule()
 void ButtonMessageModule::sayReady()
 {
     readyTone = false;
-    UserButtonThread->userButton.reset();
-    pendingClicks = 0;
+    UserButtonThread->resetClicks();
     LOG_INFO("ButtonMessage: woken by the button, listening");
     PLAY(READY);
 #ifdef BUTTON_MESSAGE_FAKE_PRESSES // bench builds: emulate this many presses right after the tone
-    pendingClicks = BUTTON_MESSAGE_FAKE_PRESSES;
     LOG_INFO("ButtonMessage: emulating %u presses", (unsigned)BUTTON_MESSAGE_FAKE_PRESSES);
+    queueClicks(UserButtonThread, BUTTON_MESSAGE_FAKE_PRESSES);
 #endif
 }
 
@@ -106,40 +103,32 @@ bool ButtonMessageModule::saveMessages()
 
 // --- button ---------------------------------------------------------------------------------------------------------
 
-// Both callbacks can run from the button pin ISR: store the count and wake the thread, nothing else.
-void ButtonMessageModule::onDoubleClick(void *self)
+bool ButtonMessageModule::queueClicks(const ButtonThread *button, unsigned clicks)
 {
-    auto *m = static_cast<ButtonMessageModule *>(self);
-    m->pendingClicks = 2;
-    m->setIntervalFromNow(0);
-}
+    if (button != UserButtonThread || clicks < 2 || !moduleConfig.canned_message.enabled)
+        return false;
+    if (readyTone || !logic.acceptsClicks(millis()))
+        return true;
+    if (!bm::messageAt(messages.messages, clicks - 2, current, sizeof(current), &pendingCritical))
+        return false;
 
-void ButtonMessageModule::onMultiClick(void *self)
-{
-    auto *m = static_cast<ButtonMessageModule *>(self);
-    int n = UserButtonThread->userButton.getNumberClicks();
-    m->pendingClicks = n > 255 ? 255 : (uint8_t)n;
-    m->setIntervalFromNow(0);
-}
-
-// Takes over the double/multi-click slots ButtonThread::initButton attached (the parameterized ones; the plain slots
-// stay empty, and both would fire). Single press and long press stay stock. Idempotent, so it runs every pass.
-void ButtonMessageModule::attachButton()
-{
-    if (!UserButtonThread)
-        return;
-    UserButtonThread->userButton.attachDoubleClick(onDoubleClick, this);
-    UserButtonThread->userButton.attachMultiClick(onMultiClick, this);
-    UserButtonThread->userButton.setClickMs(BUTTON_MESSAGE_CLICK_MS);
+    pendingClicks = clicks;
+    enabled = true;
+    setIntervalFromNow(0);
+    return true;
 }
 
 // --- thread ---------------------------------------------------------------------------------------------------------
 
 int32_t ButtonMessageModule::runOnce()
 {
-    if (!moduleConfig.canned_message.enabled)
+    if (!moduleConfig.canned_message.enabled) {
+        pendingClicks = 0;
+        pendingPacketId = 0;
+        pendingEvent = bm::Event::NONE;
+        logic.state = bm::State::IDLE;
         return disable();
-    attachButton();
+    }
     if (readyTone && UserButtonThread) {
         // Not on the first pass of the main loop: it still has multi-second one-off work ahead of it (GPS probe,
         // Bluetooth init) during which the button thread is not serviced. The second pass means the loop cycles.
@@ -149,23 +138,16 @@ int32_t ButtonMessageModule::runOnce()
     }
     uint32_t now = millis();
 
-    uint8_t clicks = pendingClicks;
+    const unsigned clicks = pendingClicks;
     pendingClicks = 0;
     if (clicks) {
-        bool crit = false;
-        char text[sizeof(current)];
-        bool has = clicks >= 2 && bm::messageAt(messages.messages, clicks - 2, text, sizeof(text), &crit);
-        LOG_INFO("ButtonMessage: %u presses -> %s", clicks, has ? text : "stock action");
-        if (has)
-            strcpy(current, text);
-        perform(logic.onClicks(clicks, has, crit, now));
+        LOG_INFO("ButtonMessage: sending canned message for %u presses", clicks);
+        perform(logic.onMessage(pendingCritical, now));
     }
 
-    uint8_t events = pendingEvents;
-    pendingEvents = 0;
-    for (int b = 0; b < 4; b++)
-        if (events & (1 << b))
-            perform(logic.onEvent((bm::Event)b, now));
+    const bm::Event event = pendingEvent;
+    pendingEvent = bm::Event::NONE;
+    perform(logic.onEvent(event));
 
     perform(logic.onTick(now));
 
@@ -184,121 +166,95 @@ void ButtonMessageModule::perform(bm::Action a)
         if (logic.critical && gps && config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_DISABLED)
             gps->toggleGpsMode(); // a critical message should be able to carry a position
 #endif
-        if (sendToFavorites(current) == 0) {
-            LOG_WARN("ButtonMessage: no favorite node to send to");
-            logic.abort();
-            PLAY(FAILED);
+        if (sendToFirstChannel()) {
+            if (logic.critical)
+                PLAY(SENT_CRITICAL);
+            else
+                PLAY(SENT);
+            service->refreshLocalMeshNode();
+            service->trySendPosition(NODENUM_BROADCAST, false); // stock position broadcast on the configured position channel
             break;
         }
-        if (logic.critical)
-            PLAY(SENT_CRITICAL);
-        else
-            PLAY(SENT);
-        service->refreshLocalMeshNode();
-        service->trySendPosition(NODENUM_BROADCAST, false); // stock position broadcast on the configured position channel
-        break;
-    case bm::Action::STOCK_PING: // what the stock double press does (ButtonThread + SystemCommandsModule)
-        playComboTune();
-        service->refreshLocalMeshNode();
-        service->trySendPosition(NODENUM_BROADCAST, true);
-        break;
-    case bm::Action::STOCK_GPS: // what the stock triple press does
-        playComboTune();
-#if !MESHTASTIC_EXCLUDE_GPS
-        if (gps)
-            gps->toggleGpsMode();
-#endif
-        break;
-    case bm::Action::STOCK_MUTE: // what the stock quadruple press does
-        if (moduleConfig.external_notification.enabled && externalNotificationModule) {
-            externalNotificationModule->setMute(!externalNotificationModule->getMute());
-            if (externalNotificationModule->getMute())
-                play4ClickDown();
-            else
-                play4ClickUp();
-        }
-        break;
-    case bm::Action::TONE_ACK:
-        nPending = 0;
-        PLAY(ACKED);
-        break;
-    case bm::Action::NODEINFO_FAIL:
-        if (nodeInfoModule && nakNode)
-            nodeInfoModule->sendOurNodeInfo(nakNode, true); // starts the key exchange so the next attempt can work
+        logic.onEvent(bm::Event::NAK);
         [[fallthrough]];
     case bm::Action::TONE_FAIL:
         if (logic.state == bm::State::IDLE)
-            nPending = 0;
+            pendingPacketId = 0;
         PLAY(FAILED);
+        break;
+    case bm::Action::TONE_ACK:
+        pendingPacketId = 0;
+        PLAY(ACKED);
         break;
     }
 }
 
-uint8_t ButtonMessageModule::sendToFavorites(const char *text)
+bool ButtonMessageModule::sendToFirstChannel()
 {
-    uint8_t body[meshtastic_Constants_DATA_PAYLOAD_LEN];
+    pendingPacketId = 0;
+    pendingEvent = bm::Event::NONE;
+
+    constexpr ChannelIndex firstChannel = 0;
+    if (channels.getByIndex(firstChannel).role == meshtastic_Channel_Role_DISABLED) {
+        LOG_WARN("ButtonMessage: first channel is disabled");
+        return false;
+    }
+
+    auto *p = allocDataPacket();
+    if (!p)
+        return false;
+
+    p->to = NODENUM_BROADCAST;
+    p->channel = firstChannel;
+    p->want_ack = true;
+    p->decoded.dest = NODENUM_BROADCAST;
+
+    auto &payload = p->decoded.payload;
     size_t len = 0;
     if (moduleConfig.canned_message.send_bell)
-        body[len++] = 7; // BEL: the receiver's External Notification bell alert
-    size_t n = strlen(text);
-    if (n > sizeof(body) - len)
-        n = sizeof(body) - len;
-    memcpy(body + len, text, n);
-    len += n;
+        payload.bytes[len++] = 7; // BEL: the receiver's External Notification bell alert
+    const size_t textLen = std::min(strlen(current), sizeof(payload.bytes) - len);
+    memcpy(payload.bytes + len, current, textLen);
+    payload.size = len + textLen;
 
-    nPending = 0;
-    NodeNum me = nodeDB->getNodeNum();
-    for (size_t i = 0; i < nodeDB->getNumMeshNodes() && nPending < BUTTON_MESSAGE_MAX_TARGETS; i++) {
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
-        if (!nodeInfoLiteIsFavorite(node) || node->num == me)
-            continue;
-        meshtastic_MeshPacket *p = allocDataPacket();
-        if (!p)
-            break;
-        p->to = node->num;
-        p->want_ack = true;
-        p->decoded.payload.size = len;
-        memcpy(p->decoded.payload.bytes, body, len);
-        pending[nPending++] = {p->id, node->num}; // before sending: a missing key NAKs synchronously inside sendToMesh
-        LOG_INFO("ButtonMessage: DM to 0x%08x id %u", node->num, p->id);
-        service->sendToMesh(p, RX_SRC_LOCAL, true);
-    }
-    return nPending;
+    pendingPacketId = p->id;
+    LOG_INFO("ButtonMessage: broadcast on channel %u id %u", (unsigned)firstChannel, p->id);
+    const auto result = service->sendToMesh(p, RX_SRC_LOCAL, true);
+    if (result == ERRNO_OK)
+        return true;
+
+    // The router can also report the send error synchronously as a NAK.
+    pendingEvent = bm::Event::NONE;
+    return false;
 }
 
 // --- acks -----------------------------------------------------------------------------------------------------------
 
 bool ButtonMessageModule::wantPacket(const meshtastic_MeshPacket *p)
 {
-    return nPending && p->decoded.portnum == meshtastic_PortNum_ROUTING_APP;
+    return pendingPacketId && p->decoded.portnum == meshtastic_PortNum_ROUTING_APP && p->decoded.request_id == pendingPacketId;
 }
 
-// Only latches an event; tones and sends happen in runOnce. A NAK for a missing key arrives while sendToMesh is still
-// on the stack, and the tones block.
+// Routing feedback can arrive inside sendToMesh, so defer tones to runOnce.
 ProcessMessage ButtonMessageModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
     if (!isToUs(&mp))
-        return ProcessMessage::CONTINUE;
-    uint8_t i = 0;
-    while (i < nPending && pending[i].id != mp.decoded.request_id)
-        i++;
-    if (i == nPending)
         return ProcessMessage::CONTINUE;
 
     meshtastic_Routing r = meshtastic_Routing_init_default;
     if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Routing_msg, &r))
         return ProcessMessage::CONTINUE;
 
-    bm::Event e;
-    if (r.which_variant == meshtastic_Routing_error_reason_tag && r.error_reason != meshtastic_Routing_Error_NONE) {
-        e = r.error_reason == meshtastic_Routing_Error_PKI_SEND_FAIL_PUBLIC_KEY ? bm::Event::NAK_PKI : bm::Event::NAK_OTHER;
-        nakNode = pending[i].dest;
+    if (r.which_variant != meshtastic_Routing_error_reason_tag)
+        return ProcessMessage::CONTINUE;
+    if (r.error_reason == meshtastic_Routing_Error_NONE) {
+        // The router generates a local ACK when it hears another node rebroadcast our packet.
+        pendingEvent = bm::Event::ACK;
+        LOG_INFO("ButtonMessage: broadcast ack for id %u", mp.decoded.request_id);
+    } else if (pendingEvent != bm::Event::ACK) {
+        pendingEvent = bm::Event::NAK;
         LOG_WARN("ButtonMessage: NAK %d for id %u", r.error_reason, mp.decoded.request_id);
-    } else {
-        e = getFrom(&mp) == pending[i].dest ? bm::Event::ACK_HOME : bm::Event::ACK_RELAY;
-        LOG_INFO("ButtonMessage: %s ack for id %u", e == bm::Event::ACK_HOME ? "home" : "relay", mp.decoded.request_id);
     }
-    pendingEvents |= 1 << (int)e;
     setIntervalFromNow(0);
     return ProcessMessage::CONTINUE; // RoutingModule must still see it to stop the radio's own retransmits
 }
@@ -326,10 +282,9 @@ AdminMessageHandleResult ButtonMessageModule::handleAdminMessageForModule(const 
             strncpy(messages.messages, in, sizeof(messages.messages));
             messages.messages[sizeof(messages.messages) - 1] = 0;
             saveMessages();
-            LOG_INFO("ButtonMessage: messages set to '%s'", messages.messages);
+            LOG_INFO("ButtonMessage: canned messages updated");
         }
-        // As the stock module does, a new list turns the module on for this session. Save canned_message.enabled
-        // (app toggle, or `meshtastic --set canned_message.enabled true`) to keep it on across reboots.
+        // Saving messages activates the handler now. The module toggle controls whether it is enabled after reboot.
         if (*in && !moduleConfig.canned_message.enabled) {
             moduleConfig.canned_message.enabled = true;
             enabled = true;
